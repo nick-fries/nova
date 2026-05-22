@@ -343,6 +343,14 @@ All of the filters in this option *must* be present in the ``[scheduler_filter]
 available_filter`` option, or a ``SchedulerHostFilterNotFound`` exception will
 be raised.
 
+The fork-added ``TopologyAffinityFilter`` is available but NOT in the
+default enabled list - it depends on Cyborg-side topology metadata
+(see the topology-aware-scheduling admin guide in the companion
+Cyborg fork). Operators who want GPU+NIC same-socket / same-NUMA
+co-location should add ``TopologyAffinityFilter`` to this list and
+set ``hw:cyborg_locality=socket`` or ``hw:cyborg_locality=numa`` on
+flavors that need the constraint.
+
 Possible values:
 
 * A list of zero or more strings, where each string corresponds to the name of

@@ -197,6 +197,16 @@ class ResourceRequest(object):
 
         res_req._translate_stateless_firmware_request(image)
 
+        # Cross-product NUMA same_subtree fork (Cyborg V620 / NUMA-in-
+        # Placement work). When the flavor requires PCI NUMA affinity
+        # and the request has both accelerator and Neutron port
+        # request groups, link them with same_subtree= so Placement
+        # returns only candidates where the accel + NIC come from the
+        # same NUMA subtree. No-op when those conditions are not met.
+        #
+        # DROP WHEN NOVA LANDS nova-spec-numa-topology-with-rps.
+        res_req._add_cross_product_same_subtree(request_spec, image)
+
         res_req.strip_zeros()
 
         return res_req
@@ -436,6 +446,123 @@ class ResourceRequest(object):
             LOG.debug(
                 "Requiring 'socket' PCI NUMA affinity support via trait %s.",
                 trait)
+
+    # ---- Cross-product NUMA same_subtree fork ----
+    # Audit findings (N1 of the cross-product-same-subtree branch):
+    #
+    # ``request_spec.same_subtree`` is a property that proxies to
+    # ``request_spec.request_level_params.same_subtree``. Today it is
+    # populated only by Neutron via
+    # ``RequestLevelParams.from_port_request`` (objects/request_spec.py
+    # ~line 1536) when a port's resource_request carries a
+    # ``same_subtree`` list, which itself only happens for ports with
+    # the extended resource_request format (one port -> multiple
+    # request groups, like NET_BW + NET_PACKET_RATE bandwidth +
+    # packet-rate). Nothing today links accelerator request groups
+    # (``device_profile_<idx>...``) to Neutron port request groups
+    # (port UUID suffixes); that's the gap this fork closes when the
+    # flavor explicitly requests NUMA PCI affinity.
+    #
+    # We add a single extra entry to ``self._same_subtree`` that lists
+    # every accel suffix + every port suffix in this ResourceRequest.
+    # Placement microversion 1.36 then enforces that all of those
+    # groups resolve to RPs in a common subtree, i.e. the same NUMA
+    # sub-RP (assuming someone has built a NUMA-aware tree - on the
+    # Cyborg side that's the ``[placement] numa_aware_subtree`` flag).
+
+    # Accelerator request groups carry ``device_profile_<idx>`` (or
+    # ``device_profile_<idx><port_uuid>``) suffixes. See
+    # nova/accelerator/cyborg.py::get_device_profile_group_requester_id.
+    _ACCEL_SUFFIX_PREFIX = "device_profile_"
+
+    # Neutron port request groups carry the port UUID (or a UUID from
+    # the extended-port-request format) as their suffix. See
+    # nova/objects/request_spec.py::RequestGroup.from_port_request
+    # and ::from_extended_port_request.
+    _UUID_LEN = 36
+
+    @staticmethod
+    def _looks_like_uuid(s):
+        """Cheap port-suffix predicate.
+
+        Port group suffixes are UUIDs. A length+hyphen-position match
+        is sufficient here - we never call this on adversarial input.
+        """
+        if not isinstance(s, str) or len(s) != ResourceRequest._UUID_LEN:
+            return False
+        # Standard 8-4-4-4-12 hyphen layout.
+        return (
+            s[8] == '-' and s[13] == '-'
+            and s[18] == '-' and s[23] == '-'
+        )
+
+    def _collect_accel_and_port_suffixes(self):
+        """Return (accel_suffixes, port_suffixes) from current groups."""
+        accel = []
+        ports = []
+        for suffix in self._rg_by_id.keys():
+            if not suffix:
+                continue
+            if suffix.startswith(self._ACCEL_SUFFIX_PREFIX):
+                accel.append(suffix)
+            elif self._looks_like_uuid(suffix):
+                ports.append(suffix)
+        return accel, ports
+
+    def _add_cross_product_same_subtree(self, request_spec, image):
+        """Link accel + NIC request groups via same_subtree= when NUMA-pinned.
+
+        Gating (all required):
+          1. request_spec.numa_topology is not None (the instance has
+             an InstanceNUMATopology, i.e. flavor specifies hw:numa_*).
+          2. flavor (or image) sets hw:pci_numa_affinity_policy to
+             ``required`` or ``socket`` (the policies that actually
+             demand co-location).
+          3. The current ResourceRequest has at least one accelerator
+             request group AND at least one Neutron port request
+             group.
+
+        When all three hold, append a single same_subtree list listing
+        every accel + port suffix. Otherwise no-op.
+
+        Backwards-compatible: existing flavors without NUMA pinning
+        are unaffected.
+        """
+        # Gate 1: NUMA topology requested.
+        numa_topo = (request_spec.numa_topology
+                     if 'numa_topology' in request_spec else None)
+        if numa_topo is None:
+            return
+        # Gate 2: PCI NUMA affinity policy demands co-location.
+        try:
+            policy = hardware.get_pci_numa_policy_constraint(
+                request_spec.flavor, image,
+            )
+        except Exception:
+            # Defensive: any policy-extraction failure means we silently
+            # decline to add same_subtree. The non-fork code path
+            # already calls the same helper and would have raised first.
+            return
+        coloc_policies = (
+            objects.fields.PCINUMAAffinityPolicy.REQUIRED,
+            objects.fields.PCINUMAAffinityPolicy.SOCKET,
+        )
+        if policy not in coloc_policies:
+            return
+        # Gate 3: at least one accel AND at least one port group.
+        accel, ports = self._collect_accel_and_port_suffixes()
+        if not accel or not ports:
+            return
+        # All gates passed. Append a stable, sorted list to keep query
+        # construction deterministic for the existing Placement query
+        # builder (which folds same_subtree= entries verbatim).
+        linked = sorted(accel) + sorted(ports)
+        self._same_subtree.append(linked)
+        LOG.debug(
+            "Cross-product NUMA same_subtree fork linked groups: %s",
+            linked,
+        )
+
 
     @property
     def group_policy(self):

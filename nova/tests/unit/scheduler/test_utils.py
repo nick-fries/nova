@@ -2744,3 +2744,185 @@ class TestResourcesFromRequestGroupDefaultPolicy(test.NoDBTestCase):
             log)
         self.assertEqual('none', rr.group_policy)
         self.assertIn('group_policy=none', rr.to_querystring())
+
+
+class TestCrossProductSameSubtreeFork(test.NoDBTestCase):
+    """Tests for ``ResourceRequest._add_cross_product_same_subtree``.
+
+    The fork's contract: when a flavor opts into PCI NUMA pinning
+    (``hw:pci_numa_affinity_policy=required`` or ``socket``) AND the
+    request has both Cyborg accelerator request groups AND Neutron
+    port request groups, append a same_subtree entry listing all
+    such suffixes so Placement enforces NUMA co-location.
+
+    See nova/scheduler/utils.py and the
+    ``feature/cross-product-same-subtree`` branch for context.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.context = nova_context.get_admin_context()
+        self.image = objects.ImageMeta(properties=objects.ImageMetaProps())
+
+    @staticmethod
+    def _accel_group(idx, owner=None):
+        # See nova/accelerator/cyborg.py::get_device_profile_group_requester_id
+        suffix = "device_profile_%d%s" % (idx, owner or "")
+        return objects.RequestGroup(
+            use_same_provider=True,
+            resources={'CUSTOM_AMD_V620_VF': 1},
+            requester_id=suffix,
+        )
+
+    def _port_group(self, port_uuid):
+        return objects.RequestGroup.from_port_request(
+            self.context, port_uuid,
+            port_resource_request={
+                "resources": {"NET_BW_IGR_KILOBIT_PER_SEC": 1000},
+                "required": ["CUSTOM_PHYSNET_2"],
+            },
+        )
+
+    @staticmethod
+    def _numa_topo():
+        # An InstanceNUMATopology with a single empty cell is enough
+        # to satisfy the "numa_topology is not None" gate.
+        cell = objects.InstanceNUMACell(
+            id=0, cpuset=set([0]), pcpuset=set(),
+            memory=1024, pagesize=None,
+        )
+        return objects.InstanceNUMATopology(cells=[cell])
+
+    # ---- Case 1: flavor without NUMA pinning ----
+    def test_no_numa_pinning_no_same_subtree(self):
+        flavor = objects.Flavor(
+            vcpus=1, memory_mb=1024, root_gb=1, ephemeral_gb=0, swap=0,
+            extra_specs={},
+        )
+        spec = objects.RequestSpec(
+            flavor=flavor, image=self.image,
+            requested_resources=[
+                self._accel_group(0), self._port_group(uuids.port1),
+            ],
+        )
+        rr = utils.ResourceRequest.from_request_spec(spec)
+        self.assertEqual([], rr._same_subtree)
+
+    # ---- Case 2: NUMA pinning, no accel/NIC groups ----
+    def test_numa_pinning_no_groups_no_same_subtree(self):
+        flavor = objects.Flavor(
+            vcpus=1, memory_mb=1024, root_gb=1, ephemeral_gb=0, swap=0,
+            extra_specs={'hw:pci_numa_affinity_policy': 'required'},
+        )
+        spec = objects.RequestSpec(
+            flavor=flavor, image=self.image, requested_resources=[],
+            numa_topology=self._numa_topo(),
+        )
+        rr = utils.ResourceRequest.from_request_spec(spec)
+        self.assertEqual([], rr._same_subtree)
+
+    # ---- Case 3: NUMA pinning + 1 accel only (no NIC) ----
+    def test_numa_pinning_accel_only_no_same_subtree(self):
+        flavor = objects.Flavor(
+            vcpus=1, memory_mb=1024, root_gb=1, ephemeral_gb=0, swap=0,
+            extra_specs={'hw:pci_numa_affinity_policy': 'required'},
+        )
+        spec = objects.RequestSpec(
+            flavor=flavor, image=self.image,
+            requested_resources=[self._accel_group(0)],
+            numa_topology=self._numa_topo(),
+        )
+        rr = utils.ResourceRequest.from_request_spec(spec)
+        self.assertEqual([], rr._same_subtree)
+
+    # ---- Case 4: NUMA pinning + 1 accel + 1 NIC ----
+    def test_numa_pinning_one_accel_one_nic_linked(self):
+        flavor = objects.Flavor(
+            vcpus=1, memory_mb=1024, root_gb=1, ephemeral_gb=0, swap=0,
+            extra_specs={'hw:pci_numa_affinity_policy': 'required'},
+        )
+        spec = objects.RequestSpec(
+            flavor=flavor, image=self.image,
+            requested_resources=[
+                self._accel_group(0),
+                self._port_group(uuids.port1),
+            ],
+            numa_topology=self._numa_topo(),
+        )
+        rr = utils.ResourceRequest.from_request_spec(spec)
+        self.assertEqual(1, len(rr._same_subtree))
+        linked = rr._same_subtree[0]
+        self.assertIn('device_profile_0', linked)
+        self.assertIn(uuids.port1, linked)
+        self.assertEqual(2, len(linked))
+
+    # ---- Case 5: NUMA pinning + 2 accel + 2 NIC ----
+    def test_numa_pinning_two_accel_two_nic_linked(self):
+        flavor = objects.Flavor(
+            vcpus=1, memory_mb=1024, root_gb=1, ephemeral_gb=0, swap=0,
+            extra_specs={'hw:pci_numa_affinity_policy': 'required'},
+        )
+        spec = objects.RequestSpec(
+            flavor=flavor, image=self.image,
+            requested_resources=[
+                self._accel_group(0),
+                self._accel_group(1),
+                self._port_group(uuids.port1),
+                self._port_group(uuids.port2),
+            ],
+            numa_topology=self._numa_topo(),
+        )
+        rr = utils.ResourceRequest.from_request_spec(spec)
+        self.assertEqual(1, len(rr._same_subtree))
+        linked = set(rr._same_subtree[0])
+        self.assertEqual(
+            {
+                'device_profile_0', 'device_profile_1',
+                uuids.port1, uuids.port2,
+            },
+            linked,
+        )
+
+    # ---- Case 6: socket policy also triggers the fork ----
+    def test_socket_policy_triggers_fork(self):
+        flavor = objects.Flavor(
+            vcpus=1, memory_mb=1024, root_gb=1, ephemeral_gb=0, swap=0,
+            extra_specs={'hw:pci_numa_affinity_policy': 'socket'},
+        )
+        spec = objects.RequestSpec(
+            flavor=flavor, image=self.image,
+            requested_resources=[
+                self._accel_group(0),
+                self._port_group(uuids.port1),
+            ],
+            numa_topology=self._numa_topo(),
+        )
+        rr = utils.ResourceRequest.from_request_spec(spec)
+        self.assertEqual(1, len(rr._same_subtree))
+
+    # ---- Case 7: preferred policy does NOT trigger the fork ----
+    def test_preferred_policy_does_not_trigger(self):
+        flavor = objects.Flavor(
+            vcpus=1, memory_mb=1024, root_gb=1, ephemeral_gb=0, swap=0,
+            extra_specs={'hw:pci_numa_affinity_policy': 'preferred'},
+        )
+        spec = objects.RequestSpec(
+            flavor=flavor, image=self.image,
+            requested_resources=[
+                self._accel_group(0),
+                self._port_group(uuids.port1),
+            ],
+            numa_topology=self._numa_topo(),
+        )
+        rr = utils.ResourceRequest.from_request_spec(spec)
+        self.assertEqual([], rr._same_subtree)
+
+    # ---- Case 8: predicate sanity ----
+    def test_looks_like_uuid(self):
+        rr_cls = utils.ResourceRequest
+        self.assertTrue(rr_cls._looks_like_uuid(uuids.port1))
+        self.assertFalse(rr_cls._looks_like_uuid("device_profile_0"))
+        self.assertFalse(rr_cls._looks_like_uuid(""))
+        self.assertFalse(rr_cls._looks_like_uuid(None))
+        self.assertFalse(rr_cls._looks_like_uuid("x" * 36))
+
