@@ -132,6 +132,7 @@ from nova.virt.libvirt.volume import mount
 from nova.virt.libvirt.volume import nfs
 from nova.virt.libvirt.volume import remotefs
 from nova.virt.libvirt.volume import volume
+from nova.virt.libvirt import xml_override
 from nova.virt import netutils
 from nova.volume import cinder
 from nova import vtpm
@@ -8191,6 +8192,7 @@ class LibvirtDriver(driver.ComputeDriver):
                                       context, mdevs, accel_info, share_info,
                                       old_guest)
         xml = conf.to_xml()
+        xml = xml_override.apply(xml, instance, image_meta)
 
         LOG.debug('End _get_guest_xml xml=%(xml)s',
                   {'xml': xml}, instance=instance)
