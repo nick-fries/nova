@@ -71,57 +71,9 @@ perform the following steps:
 Additionally the cloud operator should consider the following optional
 steps:
 
-.. _num_memory_encrypted_guests:
-
-- Configure the :oslo.config:option:`libvirt.num_memory_encrypted_guests`
-  option in :file:`nova.conf` to represent the number of guests an SEV
-  compute node can host concurrently with memory encrypted at the
-  hardware level.  For example:
-
-  .. code-block:: ini
-
-     [libvirt]
-     num_memory_encrypted_guests = 15
-
-  This option exists because on AMD SEV-capable hardware, the memory
-  controller has a fixed number of slots for holding encryption keys,
-  one per guest.  For example, at the time of writing, earlier
-  generations of hardware only have 15 slots, thereby limiting the
-  number of SEV guests which can be run concurrently to 15.  Nova
-  needs to track how many slots are available and used in order to
-  avoid attempting to exceed that limit in the hardware.
-
-  Since version 8.0.0, libvirt exposes maximum number of SEV guests
-  which can run concurrently in its host, so the limit is automatically
-  detected using this feature. So it is not necessary to configure this option.
-
-  However in case an older version of libvirt is used, it is not possible for
-  Nova to programmatically detect the correct value and Nova imposes no limit.
-  So this configuration option serves as a stop-gap, allowing the cloud
-  operator the option of providing this value manually.
-
-  This option has been deprecated and will be removed in a future release.
-
-  .. note::
-
-     If libvirt older than 8.0.0 is used, operators should carefully weigh
-     the benefits vs. the risk when deciding whether to use the default of
-     ``None`` or manually impose a limit.
-     The benefits of using the default are a) immediate convenience since
-     nothing needs to be done now, and b) convenience later when upgrading
-     compute hosts to future versions of libvirt, since again nothing will
-     need to be done for the correct limit to be automatically imposed.
-     However the risk is that until auto-detection is implemented, users may
-     be able to attempt to launch guests with encrypted memory on hosts which
-     have already reached the maximum number of guests simultaneously running
-     with encrypted memory.  This risk may be mitigated by other limitations
-     which operators can impose, for example if the smallest RAM
-     footprint of any flavor imposes a maximum number of simultaneously
-     running guests which is less than or equal to the SEV limit.
-
 - Configure :oslo.config:option:`ram_allocation_ratio` on all SEV-capable
-  compute hosts to ``1.0``. Use of SEV requires locking guest memory, meaning
-  it is not possible to overcommit host memory.
+  compute hosts to ``1.0``. Use of SEV requires that guest memory is not
+  swapped out to disks, meaning it is not possible to overcommit host memory.
 
   Alternatively, you can explicitly configure small pages for instances using
   the :nova:extra-spec:`hw:mem_page_size` flavor extra spec and equivalent
@@ -157,6 +109,19 @@ steps:
 
   __ https://bugs.launchpad.net/nova/+bug/1780138
 
+- Configure :oslo.config:option:`libvirt.cpu_mode` and
+  :oslo.config:option:`libvirt.cpu_models` properly so that the cpu model for
+  instances is capable to support the required SEV feature.
+
+  .. note::
+
+     It is also required that the appropriate QEMU firmware descriptor file is
+     present in the host operating system. These files are provided by
+     the ovmf package from distributions in most cases, but it is known that
+     Ubuntu 26.04 does not yet provide the content required to launch SEV-SNP
+     instances properly. See `bug 2160129
+     <https://bugs.launchpad.net/ubuntu/+source/edk2/+bug/2160129>`_ for
+     details.
 
 .. _extra-specs-memory-encryption:
 
@@ -174,18 +139,19 @@ enable SEV for a flavor:
    $ openstack flavor set FLAVOR-NAME \
        --property hw:mem_encryption=true
 
-It is also possible to use SEV-ES, instead of SEV, by setting
-the :nova:extra-spec:`hw:mem_encryption_model` extra spec to ``amd-sev-es``, or
-by using an image with the ``hw_mem_encryption_model`` property set to
-``amd-sev-es``. In case the extra spec and the property are unset or set to
-``amd-sev`` then SEV is used.
+It is also possible to use SEV-ES or SEV-SNP, instead of SEV, by setting
+the :nova:extra-spec:`hw:mem_encryption_model` extra spec, or by using an image
+with the ``hw_mem_encryption_model`` property. Use ``amd-sev-es`` for SEV-ES
+and ``amd-sev-snp`` for SEV-SNP. In case the extra spec and the property are
+unset or set to ``amd-sev`` then SEV is used.
 
 In all cases, SEV instances can only be booted from images which have
 the ``hw_firmware_type`` property set to ``uefi``, and only when the
 machine type is set to ``q35``.  This can be set per image by setting
 the image property ``hw_machine_type=q35``, or per compute node by
 the operator via :oslo.config:option:`libvirt.hw_machine_type` as
-explained above.
+explained above. SEV-SNP instances also require stateless firmware, which is
+enabled by the ``hw_firmware_stateless`` property set to ``true``.
 
 
 Limitations
@@ -228,8 +194,17 @@ The following limitations are expected long-term:
 
   __ https://www.redhat.com/archives/libvir-list/2019-January/msg00652.html
 
+- The number of SEV-ES guests and SEV-SNP guests allowed to run concurrently
+  will always be limited. The total ASID slots are divided into the two pools
+  (one for SEV and the other for SEV-ES and SEV-SNP), according to
+  the ``Minimum ASID for SEV`` option in BIOS.
+
 - The operating system running in an encrypted virtual machine must
   contain SEV support.
+
+- SEV-ES and SEV-SNP are mutually-exclusive in a single host, due to firmware
+  update to resolve
+  `CVE-2025-48514 <https://nvd.nist.gov/vuln/detail/CVE-2025-48514>`_ .
 
 Non-limitations
 ~~~~~~~~~~~~~~~

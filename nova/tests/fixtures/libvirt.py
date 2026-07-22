@@ -29,7 +29,6 @@ from nova.objects import fields as obj_fields
 from nova.tests.fixtures import libvirt_data as fake_libvirt_data
 from nova.virt.libvirt import config as vconfig
 from nova.virt.libvirt import driver as libvirt_driver
-from nova.virt.libvirt import host
 
 
 # Allow passing None to the various connect methods
@@ -2378,26 +2377,55 @@ class Connection(object):
     <gic supported='no'/>
   </features>'''
 
-    _domain_capability_features_with_SEV = '''  <features>
-    <gic supported='no'/>
-    <sev supported='yes'>
-      <cbitpos>47</cbitpos>
-      <reducedPhysBits>1</reducedPhysBits>
-    </sev>
-  </features>'''
-
-    _domain_capability_features_with_SEV_unsupported = \
-        _domain_capability_features_with_SEV.replace('yes', 'no')
-
-    _domain_capability_features_with_SEV_max_guests = '''  <features>
+    # TODO(tkajinam): Libvirt >= 10.0.0 always shows the sev feature.
+    # Merge this into the base template after the minimum libvirt version is
+    # bumped.
+    # https://gitlab.com/libvirt/libvirt/-/commit/6688393c6b2
+    _domain_capability_features_with_SEV_base = '''  <features>
     <gic supported='no'/>
     <sev supported='yes'>
       <cbitpos>47</cbitpos>
       <reducedPhysBits>1</reducedPhysBits>
       <maxGuests>100</maxGuests>
       <maxESGuests>15</maxESGuests>
-    </sev>
+    </sev>%s
   </features>'''
+
+    _domain_capability_features_with_SEV = \
+        _domain_capability_features_with_SEV_base % ''
+
+    _domain_capability_features_with_SEV_unsupported = '''  <features>
+    <gic supported='no'/>
+    <sev supported='no'/>
+  </features>'''
+
+    # TODO(tkajinam): Libvirt >= 10.5.0 always shows the launchSecurity
+    # feature. Merge this into the base template when minimum libvirt
+    # version is >= bumped.
+    # https://gitlab.com/libvirt/libvirt/-/commit/d460e17282b
+    _domain_capability_features_with_launch_security_SEV = \
+        _domain_capability_features_with_SEV_base % '''
+    <launchSecurity supported='yes'>
+      <enum name='sectype'>
+        <value>sev</value>
+      </enum>
+    </launchSecurity>'''
+
+    _domain_capability_features_with_launch_security_unsupported = \
+        '''  <features>
+    <gic supported='no'/>
+    <sev supported='no'/>
+    <launchSecurity supported='no'/>
+  </features>'''
+
+    _domain_capability_features_with_launch_security_SEV_SNP = \
+        _domain_capability_features_with_SEV_base % '''
+    <launchSecurity supported='yes'>
+      <enum name='sectype'>
+        <value>sev</value>
+        <value>sev-snp</value>
+      </enum>
+    </launchSecurity>'''
 
     def getCapabilities(self):
         """Return spoofed capabilities."""
@@ -2724,17 +2752,6 @@ class LibvirtFixture(fixtures.Fixture):
         self.useFixture(fixtures.MockPatch(
             'nova.virt.libvirt.host.Host._get_avail_memory_kb',
             return_value=10 * 1024 * 1024))  # 10 GB
-
-        real_exists = os.path.exists
-
-        def fake_exists(path):
-            if path == (host.SEV_KERNEL_PARAM_FILE % 'sev'):
-                return False
-            if path == (host.SEV_KERNEL_PARAM_FILE % 'sev-es'):
-                return False
-            return real_exists(path)
-
-        self.useFixture(fixtures.MonkeyPatch('os.path.exists', fake_exists))
 
         disable_event_thread(self)
 

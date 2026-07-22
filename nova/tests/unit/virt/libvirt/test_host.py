@@ -14,10 +14,11 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import os
+import io
 from unittest import mock
 
 import ddt
+import fixtures
 from lxml import etree
 from oslo_utils.fixture import uuidsentinel as uuids
 from oslo_utils import uuidutils
@@ -26,7 +27,6 @@ import testtools
 
 from nova.compute import manager
 from nova.compute import vm_states
-from nova.db import constants as db_const
 from nova import exception
 from nova import objects
 from nova.objects import fields as obj_fields
@@ -1000,8 +1000,9 @@ class HostTestCase(test.NoDBTestCase):
         self.assertEqual(vconfig.LibvirtConfigDomainCapsFeatureSev, type(sev))
         self.assertEqual(supported, sev.supported)
         if supported:
-            self.assertEqual(47, sev.cbitpos)
-            self.assertEqual(1, sev.reduced_phys_bits)
+            self.assertEqual(100, sev.max_guests)
+            self.assertEqual(15, sev.max_es_guests)
+        else:
             self.assertIsNone(sev.max_guests)
             self.assertIsNone(sev.max_es_guests)
 
@@ -1018,21 +1019,54 @@ class HostTestCase(test.NoDBTestCase):
     def test_get_domain_capabilities_sev_supported(self):
         self._test_get_domain_capabilities_sev(True)
 
-    @mock.patch.object(
-        fakelibvirt.virConnect, '_domain_capability_features', new=
-        fakelibvirt.virConnect._domain_capability_features_with_SEV_max_guests)
-    def test_get_domain_capabilities_sev_max_guests(self):
+    def _test_get_domain_capabilities_sev_with_launch_security(
+        self, supported, sectypes=None
+    ):
         caps = self._test_get_domain_capabilities()
         self.assertEqual(vconfig.LibvirtConfigDomainCaps, type(caps))
         features = caps.features
-        self.assertEqual(1, len(features))
+        self.assertEqual(2, len(features))
         sev = features[0]
         self.assertEqual(vconfig.LibvirtConfigDomainCapsFeatureSev, type(sev))
-        self.assertTrue(sev.supported)
-        self.assertEqual(47, sev.cbitpos)
-        self.assertEqual(1, sev.reduced_phys_bits)
-        self.assertEqual(100, sev.max_guests)
-        self.assertEqual(15, sev.max_es_guests)
+        self.assertEqual(supported, sev.supported)
+        if supported:
+            self.assertEqual(100, sev.max_guests)
+            self.assertEqual(15, sev.max_es_guests)
+        else:
+            self.assertIsNone(sev.max_guests)
+            self.assertIsNone(sev.max_es_guests)
+        ls = features[1]
+        self.assertEqual(supported, ls.supported)
+        self.assertEqual(vconfig.LibvirtConfigDomainCapsFeatureLaunchSecurity,
+                         type(ls))
+        self.assertEqual(supported, ls.supported)
+        if sectypes is None:
+            self.assertIsNone(ls.sectypes)
+        else:
+            self.assertEqual(sectypes, ls.sectypes)
+
+    @mock.patch.object(
+        fakelibvirt.virConnect, '_domain_capability_features',
+        new=fakelibvirt.virConnect.
+        _domain_capability_features_with_launch_security_SEV)
+    def test_get_domain_capabilities_sev_supported_launch_security(self):
+        self._test_get_domain_capabilities_sev_with_launch_security(
+            True, ['sev'])
+
+    @mock.patch.object(
+        fakelibvirt.virConnect, '_domain_capability_features',
+        new=fakelibvirt.virConnect.
+        _domain_capability_features_with_launch_security_unsupported)
+    def test_get_domain_capabilities_sev_unsupported_launch_security(self):
+        self._test_get_domain_capabilities_sev_with_launch_security(False)
+
+    @mock.patch.object(
+        fakelibvirt.virConnect, '_domain_capability_features',
+        new=fakelibvirt.virConnect.
+        _domain_capability_features_with_launch_security_SEV_SNP)
+    def test_get_domain_capabilities_sev_supported_launch_security_snp(self):
+        self._test_get_domain_capabilities_sev_with_launch_security(
+            True, ['sev', 'sev-snp'])
 
     @mock.patch.object(fakelibvirt.virConnect, "getHostname")
     def test_get_hostname_caching(self, mock_hostname):
@@ -2095,13 +2129,40 @@ class TestLibvirtSEV(test.NoDBTestCase):
             utils.StaticallyDelayingCancellableTaskExecutorWrapper(
                 delay=0.1, executor=utils._get_default_executor()))
 
+        self.kernel_sev = None
+        self.kernel_sev_es = None
+        self.kernel_sev_snp = None
+
+        def _exists(path):
+            if path == '/sys/module/kvm_amd/parameters/sev_snp':
+                return self.kernel_sev_snp is not None
+            elif path == '/sys/module/kvm_amd/parameters/sev_es':
+                return self.kernel_sev_es is not None
+            elif path == '/sys/module/kvm_amd/parameters/sev':
+                return self.kernel_sev is not None
+            self.fail('Unexpected path is accessed by os.path: %s', path)
+
+        self.mock_exists = self.useFixture(fixtures.MockPatch(
+            'os.path.exists', side_effect=_exists)).mock
+
+        def _open(path):
+            if path == '/sys/module/kvm_amd/parameters/sev_snp':
+                return io.StringIO(self.kernel_sev_snp)
+            elif path == '/sys/module/kvm_amd/parameters/sev_es':
+                return io.StringIO(self.kernel_sev_es)
+            elif path == '/sys/module/kvm_amd/parameters/sev':
+                return io.StringIO(self.kernel_sev)
+            self.fail('Unexpected path is accessed by open: %s', path)
+
+        self.mock_open = self.useFixture(fixtures.MockPatch(
+            'builtins.open', side_effect=_open)).mock
+
 
 @ddt.ddt
 class TestLibvirtSEVUnsupported(TestLibvirtSEV):
-    @mock.patch.object(os.path, 'exists', return_value=False)
-    def test_kernel_parameter_missing(self, fake_exists):
+    def test_kernel_parameter_missing(self):
         self.assertFalse(self.host._kernel_supports_amd_sev())
-        fake_exists.assert_called_once_with(
+        self.mock_exists.assert_called_once_with(
             '/sys/module/kvm_amd/parameters/sev')
 
     @ddt.data(
@@ -2111,31 +2172,26 @@ class TestLibvirtSEVUnsupported(TestLibvirtSEV):
         ('Y\n', True),
     )
     @ddt.unpack
-    @mock.patch.object(os.path, 'exists', return_value=True)
-    def test_kernel_parameter(
-        self, sev_param_value, expected_support, mock_exists
-    ):
-        with mock.patch(
-            'builtins.open', mock.mock_open(read_data=sev_param_value)
-        ):
-            self.assertIs(
-                expected_support,
-                self.host._kernel_supports_amd_sev()
-            )
-            mock_exists.assert_called_once_with(
-                '/sys/module/kvm_amd/parameters/sev')
+    def test_kernel_parameter(self, sev_param_value, expected_support):
+        self.kernel_sev = sev_param_value
+        self.assertIs(
+            expected_support,
+            self.host._kernel_supports_amd_sev()
+        )
+        self.mock_exists.assert_called_once_with(
+            '/sys/module/kvm_amd/parameters/sev')
+        self.mock_open.assert_called_once_with(
+            '/sys/module/kvm_amd/parameters/sev')
 
-    @mock.patch.object(os.path, 'exists', return_value=True)
-    @mock.patch('builtins.open', mock.mock_open(read_data="1\n"))
-    def test_unsupported_without_feature(self, fake_exists):
+    def test_unsupported_without_feature(self):
+        self.kernel_sev = "1\n"
         self.assertFalse(self.host.supports_amd_sev)
         self.assertFalse(self.host.supports_mem_encryption)
 
-    @mock.patch.object(os.path, 'exists', return_value=True)
-    @mock.patch('builtins.open', mock.mock_open(read_data="1\n"))
     @mock.patch.object(vc, '_domain_capability_features',
         new=vc._domain_capability_features_with_SEV_unsupported)
-    def test_unsupported_with_feature(self, fake_exists):
+    def test_unsupported_with_feature(self):
+        self.kernel_sev = "1\n"
         self.assertFalse(self.host.supports_amd_sev)
         self.assertFalse(self.host.supports_mem_encryption)
 
@@ -2154,26 +2210,14 @@ class TestLibvirtSEVUnsupported(TestLibvirtSEV):
             self.assertFalse(self.host.supports_amd_sev)
             self.assertFalse(self.host.supports_mem_encryption)
 
-    @mock.patch.object(os.path, 'exists', return_value=False)
-    def test_slots(self, fake_exists):
+    def test_slots(self):
         self.assertEqual(0, self.host._get_mem_encryption_slots_amd_sev())
 
-    @mock.patch.object(host.LOG, 'warning')
-    @mock.patch.object(os.path, 'exists', return_value=False)
-    def test_slots_conf_override(self, fake_exists, mock_log):
-        self.flags(num_memory_encrypted_guests=80, group='libvirt')
-        self.assertEqual(0, self.host._get_mem_encryption_slots_amd_sev())
-        mock_log.assert_called_with(
-            'Host is configured with libvirt.num_memory_encrypted_guests '
-            'set to %d, but is not SEV-capable.', 80)
-
-    @mock.patch.object(os.path, 'exists', return_value=False)
-    def test_inventory_traits(self, fake_exists):
+    def test_inventory_traits(self):
         self.assertEqual(['HW_CPU_X86_AMD_SEV'],
                          self.host._get_mem_encryption_traits_amd_sev())
 
-    @mock.patch.object(os.path, 'exists', return_value=False)
-    def test_inventory(self, fake_exists):
+    def test_inventory(self):
         inventories = self.host.get_mem_encryption_inventories()
         self.assertIn('amd_sev', inventories)
         self.assertEqual({'supported': False}, inventories['amd_sev'])
@@ -2182,54 +2226,30 @@ class TestLibvirtSEVUnsupported(TestLibvirtSEV):
 class TestLibvirtSEVSupported(TestLibvirtSEV):
     """Libvirt driver tests for when AMD SEV support is present."""
 
-    @mock.patch.object(os.path, 'exists', return_value=True)
-    @mock.patch('builtins.open', mock.mock_open(read_data="1\n"))
     @mock.patch.object(vc, '_domain_capability_features',
                        new=vc._domain_capability_features_with_SEV)
-    def test_supported_with_feature(self, fake_exists):
+    def test_supported_with_feature(self):
+        self.kernel_sev = "1\n"
         self.assertTrue(self.host.supports_amd_sev)
         self.assertTrue(self.host.supports_mem_encryption)
 
-    @mock.patch.object(os.path, 'exists', return_value=True)
-    @mock.patch('builtins.open', mock.mock_open(read_data="1\n"))
     @mock.patch.object(vc, '_domain_capability_features',
                        new=vc._domain_capability_features_with_SEV)
-    def test_slots_no_max_guests(self, fake_exists):
-        self.assertEqual(db_const.MAX_INT,
-                         self.host._get_mem_encryption_slots_amd_sev())
-
-    @mock.patch.object(os.path, 'exists', return_value=True)
-    @mock.patch('builtins.open', mock.mock_open(read_data="1\n"))
-    @mock.patch.object(vc, '_domain_capability_features',
-                       new=vc._domain_capability_features_with_SEV_max_guests)
-    def test_slots_with_max_guests(self, fake_exists):
+    def test_slots(self):
+        self.kernel_sev = "1\n"
         self.assertEqual(100, self.host._get_mem_encryption_slots_amd_sev())
 
-    @mock.patch.object(host.LOG, 'warning')
-    @mock.patch.object(os.path, 'exists', return_value=True)
-    @mock.patch('builtins.open', mock.mock_open(read_data="1\n"))
     @mock.patch.object(vc, '_domain_capability_features',
-                       new=vc._domain_capability_features_with_SEV_max_guests)
-    def test_slots_conf_override(self, fake_exists, mock_log):
-        self.flags(num_memory_encrypted_guests=200, group='libvirt')
-        self.assertEqual(100, self.host._get_mem_encryption_slots_amd_sev())
-        mock_log.assert_called_with(
-            'Host is configured with libvirt.num_memory_encrypted_guests '
-            'set to %d, but supports only %d.', 200, 100)
-
-    @mock.patch.object(os.path, 'exists', return_value=True)
-    @mock.patch('builtins.open', mock.mock_open(read_data="1\n"))
-    @mock.patch.object(vc, '_domain_capability_features',
-                       new=vc._domain_capability_features_with_SEV_max_guests)
-    def test_inventory_traits(self, fake_exists):
+                       new=vc._domain_capability_features_with_SEV)
+    def test_inventory_traits(self):
+        self.kernel_sev = "1\n"
         self.assertEqual(['HW_CPU_X86_AMD_SEV'],
                          self.host._get_mem_encryption_traits_amd_sev())
 
-    @mock.patch.object(os.path, 'exists', return_value=True)
-    @mock.patch('builtins.open', mock.mock_open(read_data="1\n"))
     @mock.patch.object(vc, '_domain_capability_features',
-                       new=vc._domain_capability_features_with_SEV_max_guests)
-    def test_inventory(self, fake_exists):
+                       new=vc._domain_capability_features_with_SEV)
+    def test_inventory(self):
+        self.kernel_sev = "1\n"
         inventories = self.host.get_mem_encryption_inventories()
         self.assertIn('amd_sev', inventories)
         self.assertEqual(
@@ -2243,10 +2263,14 @@ class TestLibvirtSEVSupported(TestLibvirtSEV):
 
 @ddt.ddt
 class TestLibvirtSEVESUnsupported(TestLibvirtSEV):
-    @mock.patch.object(os.path, 'exists', return_value=False)
-    def test_kernel_parameter_missing(self, fake_exists):
+
+    def setUp(self):
+        super().setUp()
+        self.kernel_sev = "1\n"
+
+    def test_kernel_parameter_missing(self):
         self.assertFalse(self.host._kernel_supports_amd_sev(model='sev-es'))
-        fake_exists.assert_called_once_with(
+        self.mock_exists.assert_called_once_with(
             '/sys/module/kvm_amd/parameters/sev_es')
 
     @ddt.data(
@@ -2256,30 +2280,26 @@ class TestLibvirtSEVESUnsupported(TestLibvirtSEV):
         ('Y\n', True),
     )
     @ddt.unpack
-    @mock.patch.object(os.path, 'exists', return_value=True)
     def test_kernel_parameter(
-        self, sev_param_value, expected_support, mock_exists
+        self, sev_param_value, expected_support
     ):
-        with mock.patch(
-            'builtins.open', mock.mock_open(read_data=sev_param_value)
-        ):
-            self.assertIs(
-                expected_support,
-                self.host._kernel_supports_amd_sev(model='sev-es')
-            )
-            mock_exists.assert_called_once_with(
-                '/sys/module/kvm_amd/parameters/sev_es')
+        self.kernel_sev_es = sev_param_value
+        self.assertIs(
+            expected_support,
+            self.host._kernel_supports_amd_sev(model='sev-es')
+        )
+        self.mock_exists.assert_called_once_with(
+            '/sys/module/kvm_amd/parameters/sev_es')
 
-    @mock.patch.object(os.path, 'exists', return_value=True)
-    @mock.patch('builtins.open', mock.mock_open(read_data="1\n"))
-    def test_unsupported_without_feature(self, fake_exists):
+    def test_unsupported_without_feature(self):
+        self.kernel_sev_es = "1\n"
         self.assertFalse(self.host.supports_amd_sev_es)
 
-    @mock.patch.object(os.path, 'exists', return_value=True)
-    @mock.patch('builtins.open', mock.mock_open(read_data="1\n"))
     @mock.patch.object(vc, '_domain_capability_features',
         new=vc._domain_capability_features_with_SEV_unsupported)
-    def test_unsupported_with_feature(self, fake_exists):
+    def test_unsupported_with_feature(self):
+        self.kernel_sev = "1\n"
+        self.kernel_sev_es = "1\n"
         self.assertFalse(self.host.supports_amd_sev_es)
 
     def test_non_x86_architecture(self):
@@ -2299,82 +2319,91 @@ class TestLibvirtSEVESUnsupported(TestLibvirtSEV):
     @mock.patch.object(fakelibvirt.Connection, 'getVersion',
                        return_value=versionutils.convert_version_to_int(
                             host.MIN_QEMU_SEV_ES_VERSION) - 1)
-    @mock.patch.object(os.path, 'exists', return_value=True)
-    @mock.patch('builtins.open', mock.mock_open(read_data="1\n"))
     @mock.patch.object(vc, '_domain_capability_features',
                        new=vc._domain_capability_features_with_SEV)
-    def test_unsupported_with_qemu_too_old(self, fake_exists, get_version):
+    def test_unsupported_with_qemu_too_old(self, get_version):
+        self.kernel_sev = "1\n"
+        self.kernel_sev_es = "1\n"
         self.assertFalse(self.host.supports_amd_sev_es)
 
-    @mock.patch.object(os.path, 'exists', return_value=False)
-    def test_slots(self, fake_exists):
+    @mock.patch.object(fakelibvirt.Connection, 'getVersion',
+                       return_value=versionutils.convert_version_to_int(
+                            host.MIN_QEMU_SEV_ES_VERSION))
+    @mock.patch.object(vc, '_domain_capability_features',
+                       new=vc._domain_capability_features_with_SEV)
+    def test_unsupported_without_sev(self, get_version):
+        self.kernel_sev = None
+        self.kernel_sev_es = "1\n"
+        self.assertFalse(self.host.supports_amd_sev_es)
+        self.assertFalse(self.host.supports_mem_encryption)
+
+    @mock.patch.object(fakelibvirt.Connection, 'getVersion',
+                       return_value=versionutils.convert_version_to_int(
+                            host.MIN_QEMU_SEV_ES_VERSION))
+    @mock.patch.object(vc, '_domain_capability_features',
+                       new=vc._domain_capability_features_with_SEV)
+    def test_unsupported_with_snp(self, get_version):
+        self.kernel_sev_es = "1\n"
+        self.kernel_sev_snp = "1\n"
+        self.assertFalse(self.host.supports_amd_sev_es)
+        self.assertTrue(self.host.supports_mem_encryption)
+
+    def test_slots(self):
         self.assertEqual(0, self.host._get_mem_encryption_slots_amd_sev_es())
 
-    @mock.patch.object(os.path, 'exists', return_value=False)
-    def test_inventory_traits(self, fake_exists):
+    def test_inventory_traits(self):
         self.assertEqual(['HW_CPU_X86_AMD_SEV_ES'],
                          self.host._get_mem_encryption_traits_amd_sev_es())
 
-    @mock.patch.object(os.path, 'exists', return_value=False)
-    def test_inventory(self, fake_exists):
+    def test_inventory(self):
         inventories = self.host.get_mem_encryption_inventories()
         self.assertIn('amd_sev_es', inventories)
         self.assertEqual({'supported': False}, inventories['amd_sev_es'])
 
 
 class TestLibvirtSEVESSupported(TestLibvirtSEV):
-    """Libvirt driver tests for when AMD SEV support is present."""
+    """Libvirt driver tests for when AMD SEV-ES support is present."""
+
+    def setUp(self):
+        super().setUp()
+        self.kernel_sev = "1\n"
 
     @mock.patch.object(fakelibvirt.Connection, 'getVersion',
                        return_value=versionutils.convert_version_to_int(
                             host.MIN_QEMU_SEV_ES_VERSION))
-    @mock.patch.object(os.path, 'exists', return_value=True)
-    @mock.patch('builtins.open', mock.mock_open(read_data="1\n"))
     @mock.patch.object(vc, '_domain_capability_features',
                        new=vc._domain_capability_features_with_SEV)
-    def test_supported_with_feature(self, fake_exists, get_version):
+    def test_supported_with_feature(self, get_version):
+        self.kernel_sev_es = "1\n"
         self.assertTrue(self.host.supports_amd_sev_es)
         self.assertTrue(self.host.supports_mem_encryption)
 
     @mock.patch.object(fakelibvirt.Connection, 'getVersion',
                        return_value=versionutils.convert_version_to_int(
                             host.MIN_QEMU_SEV_ES_VERSION))
-    @mock.patch.object(os.path, 'exists', return_value=True)
-    @mock.patch('builtins.open', mock.mock_open(read_data="1\n"))
     @mock.patch.object(vc, '_domain_capability_features',
                        new=vc._domain_capability_features_with_SEV)
-    def test_slots_no_max_guests(self, fake_exists, get_version):
-        self.assertEqual(0, self.host._get_mem_encryption_slots_amd_sev_es())
-
-    @mock.patch.object(fakelibvirt.Connection, 'getVersion',
-                       return_value=versionutils.convert_version_to_int(
-                            host.MIN_QEMU_SEV_ES_VERSION))
-    @mock.patch.object(os.path, 'exists', return_value=True)
-    @mock.patch('builtins.open', mock.mock_open(read_data="1\n"))
-    @mock.patch.object(vc, '_domain_capability_features',
-                       new=vc._domain_capability_features_with_SEV_max_guests)
-    def test_slots_with_max_guests(self, fake_exists, get_version):
+    def test_slots_(self, get_version):
+        self.kernel_sev_es = "1\n"
         self.assertEqual(15, self.host._get_mem_encryption_slots_amd_sev_es())
 
     @mock.patch.object(fakelibvirt.Connection, 'getVersion',
                        return_value=versionutils.convert_version_to_int(
                             host.MIN_QEMU_SEV_ES_VERSION))
-    @mock.patch.object(os.path, 'exists', return_value=True)
-    @mock.patch('builtins.open', mock.mock_open(read_data="1\n"))
     @mock.patch.object(vc, '_domain_capability_features',
-                       new=vc._domain_capability_features_with_SEV_max_guests)
-    def test_inventory_traits(self, fake_exists, get_version):
+                       new=vc._domain_capability_features_with_SEV)
+    def test_inventory_traits(self, get_version):
+        self.kernel_sev_es = "1\n"
         self.assertEqual(['HW_CPU_X86_AMD_SEV_ES'],
                          self.host._get_mem_encryption_traits_amd_sev_es())
 
     @mock.patch.object(fakelibvirt.Connection, 'getVersion',
                        return_value=versionutils.convert_version_to_int(
                             host.MIN_QEMU_SEV_ES_VERSION))
-    @mock.patch.object(os.path, 'exists', return_value=True)
-    @mock.patch('builtins.open', mock.mock_open(read_data="1\n"))
     @mock.patch.object(vc, '_domain_capability_features',
-                       new=vc._domain_capability_features_with_SEV_max_guests)
-    def test_inventory(self, fake_exists, get_version):
+                       new=vc._domain_capability_features_with_SEV)
+    def test_inventory(self, get_version):
+        self.kernel_sev_es = "1\n"
         inventories = self.host.get_mem_encryption_inventories()
         self.assertIn('amd_sev_es', inventories)
         self.assertEqual(
@@ -2384,6 +2413,143 @@ class TestLibvirtSEVESSupported(TestLibvirtSEV):
                 'traits': ['HW_CPU_X86_AMD_SEV_ES'],
             },
             inventories['amd_sev_es'])
+
+
+@ddt.ddt
+class TestLibvirtSEVSNPUnsupported(TestLibvirtSEV):
+
+    def setUp(self):
+        super().setUp()
+        self.kernel_sev = "1\n"
+
+    def test_kernel_parameter_missing(self):
+        self.assertFalse(self.host._kernel_supports_amd_sev(model='sev-snp'))
+        self.mock_exists.assert_called_once_with(
+            '/sys/module/kvm_amd/parameters/sev_snp')
+
+    @ddt.data(
+        ('0\n', False),
+        ('N\n', False),
+        ('1\n', True),
+        ('Y\n', True),
+    )
+    @ddt.unpack
+    def test_kernel_parameter(self, sev_param_value, expected_support):
+        self.kernel_sev_snp = sev_param_value
+        self.assertIs(
+            expected_support,
+            self.host._kernel_supports_amd_sev(model='sev-snp')
+        )
+        self.mock_exists.assert_called_once_with(
+            '/sys/module/kvm_amd/parameters/sev_snp')
+
+    def test_unsupported_without_sev_feature(self):
+        self.kernel_sev_snp = "1\n"
+        self.assertFalse(self.host.supports_amd_sev_snp)
+
+    @mock.patch.object(vc, '_domain_capability_features',
+        new=vc._domain_capability_features_with_SEV_unsupported)
+    def test_unsupported_with_feature(self):
+        self.kernel_sev_snp = "1\n"
+        self.assertFalse(self.host.supports_amd_sev_snp)
+
+    @mock.patch.object(vc, '_domain_capability_features',
+        new=vc.
+        _domain_capability_features_with_launch_security_unsupported)
+    def test_unsupported_with_launch_security(self):
+        self.kernel_sev_snp = "1\n"
+        self.assertFalse(self.host.supports_amd_sev_snp)
+
+    @mock.patch.object(vc, '_domain_capability_features',
+        new=vc.
+        _domain_capability_features_with_launch_security_SEV)
+    def test_unsupported_with_launch_security_no_snp(self):
+        self.kernel_sev_snp = "1\n"
+        self.assertFalse(self.host.supports_amd_sev_snp)
+
+    def test_non_x86_architecture(self):
+        fake_caps_xml = '''
+<capabilities>
+  <host>
+    <uuid>cef19ce0-0ca2-11df-855d-b19fbce37686</uuid>
+    <cpu>
+      <arch>aarch64</arch>
+    </cpu>
+  </host>
+</capabilities>'''
+        with mock.patch.object(fakelibvirt.virConnect, 'getCapabilities',
+                               return_value=fake_caps_xml):
+            self.assertFalse(self.host.supports_amd_sev_snp)
+
+    @mock.patch.object(vc, '_domain_capability_features',
+        new=vc.
+        _domain_capability_features_with_launch_security_SEV_SNP)
+    def test_unsupported_without_sev(self):
+        self.kernel_sev = None
+        self.kernel_sev_snp = "1\n"
+        self.assertFalse(self.host.supports_amd_sev_snp)
+        self.assertFalse(self.host.supports_mem_encryption)
+
+    @mock.patch.object(vc, '_domain_capability_features',
+        new=vc.
+        _domain_capability_features_with_launch_security_SEV_SNP)
+    def test_slots(self):
+        self.assertEqual(0, self.host._get_mem_encryption_slots_amd_sev_snp())
+
+    def test_inventory_traits(self):
+        self.assertEqual(['HW_CPU_X86_AMD_SEV_SNP'],
+                         self.host._get_mem_encryption_traits_amd_sev_snp())
+
+    def test_inventory(self):
+        inventories = self.host.get_mem_encryption_inventories()
+        self.assertIn('amd_sev_snp', inventories)
+        self.assertEqual({'supported': False}, inventories['amd_sev_snp'])
+
+
+class TestLibvirtSEVSNPSupported(TestLibvirtSEV):
+    """Libvirt driver tests for when AMD SEV-SNP support is present."""
+
+    def setUp(self):
+        super().setUp()
+        self.kernel_sev = "1\n"
+
+    @mock.patch.object(
+        vc, '_domain_capability_features',
+        new=vc._domain_capability_features_with_launch_security_SEV_SNP)
+    def test_supported_with_feature(self):
+        self.kernel_sev_snp = "1\n"
+        self.assertTrue(self.host.supports_amd_sev_snp)
+        self.assertTrue(self.host.supports_mem_encryption)
+
+    @mock.patch.object(
+        vc, '_domain_capability_features',
+        new=vc._domain_capability_features_with_launch_security_SEV_SNP)
+    def test_slots(self):
+        self.kernel_sev_snp = "1\n"
+        self.assertEqual(15, self.host._get_mem_encryption_slots_amd_sev_snp())
+
+    @mock.patch.object(
+        vc, '_domain_capability_features',
+        new=vc._domain_capability_features_with_launch_security_SEV_SNP)
+    def test_inventory_traits(self):
+        self.kernel_sev_snp = "1\n"
+        self.assertEqual(['HW_CPU_X86_AMD_SEV_SNP'],
+                         self.host._get_mem_encryption_traits_amd_sev_snp())
+
+    @mock.patch.object(
+        vc, '_domain_capability_features',
+        new=vc._domain_capability_features_with_launch_security_SEV_SNP)
+    def test_inventory(self):
+        self.kernel_sev_snp = "1\n"
+        inventories = self.host.get_mem_encryption_inventories()
+        self.assertIn('amd_sev_snp', inventories)
+        self.assertEqual(
+            {
+                'supported': True,
+                'total': 15,
+                'traits': ['HW_CPU_X86_AMD_SEV_SNP'],
+            },
+            inventories['amd_sev_snp'])
 
 
 class LibvirtTpoolProxyTestCase(test.NoDBTestCase):

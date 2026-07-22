@@ -977,6 +977,7 @@ class LibvirtDriver(driver.ComputeDriver):
     def process_instances_at_startup(self, context, instances):
         self._validate_pinning_configuration(instances)
         self._validate_vtpm_configuration(instances)
+        self._validate_mem_encryption_configuration(instances)
         self._register_all_undefined_instance_details(context, instances)
         return instances
 
@@ -1083,6 +1084,39 @@ class LibvirtDriver(driver.ComputeDriver):
                     'vTPM support.'
                 )
                 raise exception.InvalidConfiguration(msg)
+
+    def _validate_mem_encryption_configuration(
+        self,
+        instances: 'objects.InstanceList',
+    ) -> None:
+
+        for instance in instances:
+            if instance.deleted:
+                continue
+
+            try:
+                mem_enc = hardware.get_mem_encryption_constraint(
+                    instance.flavor, instance.image_meta,
+                )
+            except exception.FlavorImageConflict:
+                continue
+
+            if not mem_enc:
+                continue
+
+            if self._is_supported_mem_encryption_model(mem_enc.model):
+                continue
+
+            msg = _(
+                'This host has instances with the memory encryption feature '
+                'by %s enabled but the host is configured not to support '
+                'this feature any more. '
+                'Please move or delete these instances from this host, '
+                'before disabling the feature support. '
+                'Evacuate the instances or fix configuration to enable '
+                'the feature to recover the nova-compute service.'
+            )
+            raise exception.InvalidConfiguration(msg % mem_enc.model)
 
     def _register_all_undefined_instance_details(
         self,
@@ -2296,14 +2330,9 @@ class LibvirtDriver(driver.ComputeDriver):
             provider = encryptors.LEGACY_PROVIDER_CLASS_TO_FORMAT_MAP[provider]
         return provider == encryptors.LUKS
 
-    def _get_volume_config(self, instance, connection_info, disk_info):
+    def _get_volume_config(self, connection_info, disk_info):
         vol_driver = self._get_volume_driver(connection_info)
         conf = vol_driver.get_config(connection_info, disk_info)
-
-        if self._get_mem_encryption_config(
-                instance.flavor, instance.image_meta):
-            designer.set_driver_iommu_for_device(conf)
-
         self._set_cache_mode(conf)
         return conf
 
@@ -2464,7 +2493,7 @@ class LibvirtDriver(driver.ComputeDriver):
         if disk_info['bus'] == 'scsi':
             disk_info['unit'] = self._get_scsi_controller_next_unit(guest)
 
-        conf = self._get_volume_config(instance, connection_info, disk_info)
+        conf = self._get_volume_config(connection_info, disk_info)
 
         self._check_discard_for_attach_volume(conf, instance)
 
@@ -2585,8 +2614,7 @@ class LibvirtDriver(driver.ComputeDriver):
         # this to the BDM here as the upper compute swap_volume method will
         # eventually do this for us.
         self._connect_volume(context, new_connection_info, instance)
-        conf = self._get_volume_config(
-            instance, new_connection_info, disk_info)
+        conf = self._get_volume_config(new_connection_info, disk_info)
 
         try:
             self._swap_volume(guest, disk_dev, conf, resize_to)
@@ -3174,9 +3202,6 @@ class LibvirtDriver(driver.ComputeDriver):
         cfg = self.vif_driver.get_config(instance, vif, image_meta,
                                          instance.flavor,
                                          CONF.libvirt.virt_type)
-
-        if self._get_mem_encryption_config(instance.flavor, image_meta):
-            designer.set_driver_iommu_for_device(cfg)
 
         try:
             state = guest.get_power_state(self._host)
@@ -6271,7 +6296,7 @@ class LibvirtDriver(driver.ComputeDriver):
                 else:
                     info['unit'] = disk_mapping['unit']
                     disk_mapping['unit'] += 1
-            cfg = self._get_volume_config(instance, connection_info, info)
+            cfg = self._get_volume_config(connection_info, info)
             devices.append(cfg)
             vol['connection_info'] = connection_info
             vol.save()
@@ -7032,11 +7057,6 @@ class LibvirtDriver(driver.ComputeDriver):
         rng_device.backend = rng_path
         guest.add_device(rng_device)
 
-    def _add_virtio_serial_controller(self, guest, instance):
-        virtio_controller = vconfig.LibvirtConfigGuestController()
-        virtio_controller.type = 'virtio-serial'
-        guest.add_device(virtio_controller)
-
     def _add_vtpm_device(
         self,
         guest: vconfig.LibvirtConfigGuest,
@@ -7089,14 +7109,6 @@ class LibvirtDriver(driver.ComputeDriver):
     def _set_qemu_guest_agent(self, guest, flavor, instance, image_meta):
         # Enable qga only if the 'hw_qemu_guest_agent' is equal to yes
         if image_meta.properties.get('hw_qemu_guest_agent', False):
-            # a virtio-serial controller is required for qga. If it is not
-            # created explicitly, libvirt will do it by itself. But in case
-            # of AMD SEV, any virtio device should use iommu driver, and
-            # libvirt does not know about it. That is why the controller
-            # should be created manually.
-            if self._get_mem_encryption_config(flavor, image_meta):
-                self._add_virtio_serial_controller(guest, instance)
-
             LOG.debug("Qemu guest agent is enabled through image "
                       "metadata", instance=instance)
             self._add_qga_device(guest, instance)
@@ -7853,9 +7865,7 @@ class LibvirtDriver(driver.ComputeDriver):
             self._guest_add_mdevs(guest, mdevs)
 
         if me_config:
-            caps = self._host.get_capabilities()
-            self._guest_configure_mem_encryption(guest, caps.host.cpu.arch,
-                                                 guest.os_mach_type,
+            self._guest_configure_mem_encryption(instance, guest,
                                                  me_config.model)
 
         if vpmems:
@@ -7925,11 +7935,11 @@ class LibvirtDriver(driver.ComputeDriver):
         return hardware.get_mem_encryption_constraint(flavor, image_meta,
                                                       mach_type)
 
-    def _guest_configure_mem_encryption(self, guest, arch, mach_type, model):
+    def _guest_configure_mem_encryption(self, instance, guest, model):
         if model in (fields.MemEncryptionModel.AMD_SEV,
-                     fields.MemEncryptionModel.AMD_SEV_ES):
-            self._guest_configure_sev_mem_encryption(
-                guest, arch, mach_type, model)
+                     fields.MemEncryptionModel.AMD_SEV_ES,
+                     fields.MemEncryptionModel.AMD_SEV_SNP):
+            self._guest_configure_sev_mem_encryption(instance, guest, model)
         else:
             raise exception.Invalid(
                 "Unknown MemEncryptionModel: %(model)s. "
@@ -7938,61 +7948,18 @@ class LibvirtDriver(driver.ComputeDriver):
                     'supported': ', '.join(fields.MemEncryptionModel.ALL)
                 })
 
-    def _guest_configure_sev_mem_encryption(
-        self, guest, arch, mach_type, model):
-        sev = self._find_sev_feature(arch, mach_type)
-        if sev is None:
-            # In theory this should never happen because it should
-            # only get called if SEV was requested, in which case the
-            # guest should only get scheduled on this host if it
-            # supports SEV, and SEV support is dependent on the
-            # presence of this <sev> feature.  That said, it's
-            # conceivable that something could get messed up along the
-            # way, e.g. a mismatch in the choice of machine type.  So
-            # make sure that if it ever does happen, we at least get a
-            # helpful error rather than something cryptic like
-            # "AttributeError: 'NoneType' object has no attribute 'cbitpos'
-            raise exception.MissingDomainCapabilityFeatureException(
-                feature='sev')
-
-        designer.set_driver_iommu_for_all_devices(guest)
-        self._guest_add_sev_launch_security(guest, sev, model)
-
-    def _guest_add_sev_launch_security(self, guest, sev, model):
-        launch_security = vconfig.LibvirtConfigGuestSEVLaunchSecurity()
-        launch_security.cbitpos = sev.cbitpos
-        launch_security.reduced_phys_bits = sev.reduced_phys_bits
-        # NOTE(tkajinam): Default policy is for SEV
-        if model == fields.MemEncryptionModel.AMD_SEV_ES:
+    def _guest_configure_sev_mem_encryption(self, instance, guest, model):
+        if model == fields.MemEncryptionModel.AMD_SEV_SNP:
+            launch_security = vconfig.LibvirtConfigGuestSEVSNPLaunchSecurity()
+            if instance.kernel_id:
+                launch_security.kernelHashes = True
+        elif model == fields.MemEncryptionModel.AMD_SEV_ES:
+            launch_security = vconfig.LibvirtConfigGuestSEVLaunchSecurity()
             launch_security.policy = launch_security.DEFAULT_SEV_ES_POLICY
+        else:
+            launch_security = vconfig.LibvirtConfigGuestSEVLaunchSecurity()
+
         guest.launch_security = launch_security
-
-    def _find_sev_feature(self, arch, mach_type):
-        """Search domain capabilities for the given arch and machine type
-        for the <sev> element under <features>, and return it if found.
-        """
-        domain_caps = self._host.get_domain_capabilities()
-        if arch not in domain_caps:
-            LOG.warning(
-                "Wanted to add SEV to config for guest with arch %(arch)s "
-                "but only had domain capabilities for: %(archs)s",
-                {'arch': arch, 'archs': ' '.join(domain_caps)})
-            return None
-
-        if mach_type not in domain_caps[arch]:
-            LOG.warning(
-                "Wanted to add SEV to config for guest with machine type "
-                "%(mtype)s but for arch %(arch)s only had domain capabilities "
-                "for machine types: %(mtypes)s",
-                {'mtype': mach_type, 'arch': arch,
-                 'mtypes': ' '.join(domain_caps[arch])})
-            return None
-
-        for feature in domain_caps[arch][mach_type].features:
-            if feature.root_name == 'sev':
-                return feature
-
-        return None
 
     def _guest_add_mdevs(self, guest, chosen_mdevs):
         for chosen_mdev in chosen_mdevs:
@@ -13634,6 +13601,16 @@ class LibvirtDriver(driver.ComputeDriver):
                            nova.privsep.fs.FS_FORMAT_EXT3,
                            nova.privsep.fs.FS_FORMAT_EXT4,
                            nova.privsep.fs.FS_FORMAT_XFS]
+
+    def _is_supported_mem_encryption_model(self, me_model):
+        if me_model == fields.MemEncryptionModel.AMD_SEV:
+            return self._host.supports_amd_sev
+        if me_model == fields.MemEncryptionModel.AMD_SEV_ES:
+            return self._host.supports_amd_sev_es
+        if me_model == fields.MemEncryptionModel.AMD_SEV_SNP:
+            return self._host.supports_amd_sev_snp
+        raise exception.Invalid('Invalid memory encryption model: %r' %
+                                me_model)
 
     def _get_tpm_traits(self) -> dict[str, bool]:
         # Assert or deassert TPM support traits

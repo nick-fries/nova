@@ -2105,6 +2105,10 @@ class FirmwareSMMNotSupported(Invalid):
     msg_fmt = _("This firmware doesn't require (support) SMM")
 
 
+class StatelessFirmwareRequired(Invalid):
+    msg_fmt = _("%(feature)s requires stateless firmware")
+
+
 class TriggerCrashDumpNotSupported(Invalid):
     msg_fmt = _("Triggering crash dump is not supported")
 
@@ -2458,11 +2462,6 @@ class FlavorImageLockedMemoryConflict(FlavorImageConflict):
     msg_fmt = _("locked_memory value in image (%(image)s) and flavor "
                 "(%(flavor)s) conflict. A consistent value is expected if "
                 "both specified.")
-
-
-class MissingDomainCapabilityFeatureException(NovaException):
-    msg_fmt = _("Guest config could not be built without domain capabilities "
-                "including <%(feature)s> feature.")
 
 
 class HealAllocationException(NovaException):
